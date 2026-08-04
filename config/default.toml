@@ -119,6 +119,11 @@ version = "0.5.15"
 init_timeout_secs = 60
 poll_ms = 3
 
+[sandbox]
+# Shared secret used to derive per-sandbox envd access tokens. All nodes in a
+# cluster must use the same value. Prefer AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED.
+# access_token_hash_seed = "replace-with-a-secret"
+
 [orchestrator]
 auto_evict_interval_ms = 1000
 default_sandbox_timeout_secs = 15
