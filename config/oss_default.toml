@@ -81,11 +81,6 @@ version = "0.5.15"
 init_timeout_secs = 60
 poll_ms = 3
 
-[sandbox]
-# Required for normal server startup. Prefer setting
-# AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED for validation deployments.
-# access_token_hash_seed = "replace-with-a-secret"
-
 [orchestrator]
 auto_evict_interval_ms = 1000
 default_sandbox_timeout_secs = 15
