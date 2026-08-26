@@ -37,6 +37,7 @@ use crate::image::local_layer::LocalLayer;
 use crate::image::oci_image::{ImageConversion, LayerConversionKey};
 use crate::image::ImageResolutionMetadata;
 use crate::local_store::LocalStoreDurability;
+use crate::p2p::{P2pArtifactKey, P2pTransport};
 
 const IMAGE_CACHE_CONFIG_DIR: &str = "configs";
 const IMAGE_CACHE_INDEX_DIR: &str = "indexes";
@@ -79,6 +80,7 @@ pub(crate) struct ImageCacheService {
     staging_dir: PathBuf,
     metadata_store: OnceCell<ImageCacheMetadataStore>,
     source_images: Arc<SourceImageCache>,
+    p2p_transport: OnceLock<Arc<dyn P2pTransport>>,
 }
 
 impl fmt::Debug for ImageCacheService {
@@ -124,7 +126,15 @@ impl ImageCacheService {
             commit_store,
             metadata_store: OnceCell::new(),
             source_images: Arc::new(SourceImageCache::default()),
+            p2p_transport: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn initialize_p2p_transport(&self, transport: Arc<dyn P2pTransport>) {
+        assert!(
+            self.p2p_transport.set(transport).is_ok(),
+            "image cache P2P transport already initialized"
+        );
     }
 
     /// Compute the `(config, metadata)` sidecar paths for a source image
@@ -241,10 +251,27 @@ impl ImageCacheService {
         digest: impl Into<String>,
         file: Option<PathBuf>,
         size: Option<u64>,
+        p2p_keys: &[P2pArtifactKey],
     ) -> Result<()> {
         self.metadata_store()
             .await?
-            .record_hard_commit_object(HardCommitId::new(digest)?, file, size)
+            .record_hard_commit_object(
+                HardCommitId::new(digest)?,
+                file,
+                size,
+                p2p_keys.iter().cloned().collect(),
+            )
+            .await
+    }
+
+    pub(crate) async fn add_hard_commit_p2p_key(
+        &self,
+        digest: &str,
+        key: &P2pArtifactKey,
+    ) -> Result<()> {
+        self.metadata_store()
+            .await?
+            .add_hard_commit_p2p_key(&HardCommitId::new(digest)?, key)
             .await
     }
 
@@ -263,7 +290,7 @@ impl ImageCacheService {
         .await?;
 
         let result = self
-            .seed_and_record_hard_commit(source, digest, size, true)
+            .seed_and_record_hard_commit(source, digest, size, true, &[])
             .await;
         hold.release_best_effort("hard_commit_import_release").await;
         result
@@ -278,6 +305,7 @@ impl ImageCacheService {
         digest: &str,
         size: u64,
         trusted_descriptor: bool,
+        p2p_keys: &[P2pArtifactKey],
     ) -> Result<PathBuf> {
         let commit_store = self.commit_store.clone();
         let source = source.to_path_buf();
@@ -296,7 +324,7 @@ impl ImageCacheService {
         })
         .await
         .context("join hard commit seed task")??;
-        self.record_hard_commit_object(digest, Some(cached_path.clone()), Some(size))
+        self.record_hard_commit_object(digest, Some(cached_path.clone()), Some(size), p2p_keys)
             .await?;
         Ok(cached_path)
     }
@@ -578,6 +606,7 @@ impl ImageCacheService {
             digest,
             file,
             size: record.size,
+            p2p_keys: record.p2p_keys.clone(),
         })
     }
 
@@ -635,7 +664,22 @@ impl ImageCacheService {
         &self,
         digest: &HardCommitId,
         file: &Path,
+        p2p_keys: &BTreeSet<P2pArtifactKey>,
     ) -> Result<()> {
+        if !p2p_keys.is_empty() {
+            let transport = self
+                .p2p_transport
+                .get()
+                .cloned()
+                .context("image cache P2P transport is not initialized")?;
+            for key in p2p_keys {
+                transport
+                    .unpublish(key)
+                    .await
+                    .with_context(|| format!("unpublish image cache P2P key '{key}'"))?;
+            }
+        }
+
         tokio::fs::remove_file(file)
             .await
             .with_context(|| format!("remove image cache commit file {}", file.display()))?;
@@ -727,8 +771,16 @@ impl ImageCacheService {
                             )
                             .await?
                         {
-                            HardCommitGcDecision::Collectable { digest, file, size } => {
-                                match self.delete_collectable_hard_commit(&digest, &file).await {
+                            HardCommitGcDecision::Collectable {
+                                digest,
+                                file,
+                                size,
+                                p2p_keys,
+                            } => {
+                                match self
+                                    .delete_collectable_hard_commit(&digest, &file, &p2p_keys)
+                                    .await
+                                {
                                     Ok(()) => {
                                         report.collected += 1;
                                         report.freed_bytes += size.unwrap_or(0);
@@ -1147,10 +1199,11 @@ impl ImageCacheOperationHold {
         temp_commit: &Path,
         digest: &str,
         size: u64,
+        p2p_keys: &[P2pArtifactKey],
     ) -> Result<PathBuf> {
         self.protect_hard_commit(digest).await?;
         self.image_cache
-            .seed_and_record_hard_commit(temp_commit, digest, size, true)
+            .seed_and_record_hard_commit(temp_commit, digest, size, true, p2p_keys)
             .await
     }
 }
@@ -1277,7 +1330,7 @@ impl ImageConversion for ImageCacheOperationHold {
             )
         })?;
         let stored = self
-            .persist_overlaybd_commit(temp_commit, &described.sha256, described.size)
+            .persist_overlaybd_commit(temp_commit, &described.sha256, described.size, &[])
             .await?;
         let index = CommitIndex::oci_layer(
             key.source_layer_digest.clone(),
@@ -1346,6 +1399,7 @@ enum HardCommitGcDecision {
         digest: HardCommitId,
         file: PathBuf,
         size: Option<u64>,
+        p2p_keys: BTreeSet<P2pArtifactKey>,
     },
     Blocked(ImageCacheGcBlocked),
 }
@@ -1363,6 +1417,7 @@ mod tests {
     use crate::cfg::ResolvedImageCacheConfig;
     use crate::image::commit_index;
     use crate::image::ImageBaseContext;
+    use crate::p2p::mock::MockTransport;
 
     fn test_service(temp: &TempDir) -> ImageCacheService {
         let root_dir = temp.path().join("image-cache");
@@ -1628,24 +1683,31 @@ mod tests {
     async fn run_gc_collects_free_candidate_and_skips_roots_holds_and_live_refs() {
         let temp = TempDir::new().expect("tempdir");
         let service = Arc::new(test_service(&temp));
+        let p2p = Arc::new(MockTransport::default());
+        service.initialize_p2p_transport(p2p.clone());
         let free_file = write_commit_file(&service, "sha256:free", b"free");
         let rooted_file = write_commit_file(&service, "sha256:rooted", b"rooted");
         let held_file = write_commit_file(&service, "sha256:held", b"held");
         let live_file = write_commit_file(&service, "sha256:live", b"live");
         service
-            .record_hard_commit_object("sha256:free", Some(free_file.clone()), Some(4))
+            .record_hard_commit_object(
+                "sha256:free",
+                Some(free_file.clone()),
+                Some(4),
+                &["overlaybd-layer/v1/explicit-free".to_string()],
+            )
             .await
             .expect("record free object");
         service
-            .record_hard_commit_object("sha256:rooted", Some(rooted_file.clone()), Some(6))
+            .record_hard_commit_object("sha256:rooted", Some(rooted_file.clone()), Some(6), &[])
             .await
             .expect("record rooted object");
         service
-            .record_hard_commit_object("sha256:held", Some(held_file.clone()), Some(4))
+            .record_hard_commit_object("sha256:held", Some(held_file.clone()), Some(4), &[])
             .await
             .expect("record held object");
         service
-            .record_hard_commit_object("sha256:live", Some(live_file.clone()), Some(4))
+            .record_hard_commit_object("sha256:live", Some(live_file.clone()), Some(4), &[])
             .await
             .expect("record live object");
         let source_config = service.config_dir.join("base-image.json");
@@ -1684,6 +1746,10 @@ mod tests {
         assert_eq!(report.collected, 1);
         assert_eq!(report.freed_bytes, 4);
         assert!(!free_file.exists());
+        assert_eq!(
+            *p2p.unpublished_keys.read().await,
+            vec!["overlaybd-layer/v1/explicit-free".to_string()]
+        );
         assert!(held_file.exists());
         assert!(live_file.exists());
         assert!(rooted_file.exists());
@@ -1714,6 +1780,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_gc_refuses_p2p_object_without_initialized_transport() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let file = write_commit_file(&service, "sha256:p2p", b"p2p");
+        service
+            .record_hard_commit_object(
+                "sha256:p2p",
+                Some(file.clone()),
+                Some(3),
+                &["overlaybd-layer/v1/p2p".to_string()],
+            )
+            .await
+            .expect("record P2P object");
+
+        let report = service.run_gc(BTreeMap::new(), true).await.expect("run gc");
+
+        assert_eq!(report.collected, 0);
+        assert!(file.exists());
+        assert!(report.blocked.iter().any(|blocked| {
+            blocked.digest.as_str() == "sha256:p2p"
+                && matches!(
+                    &blocked.reason,
+                    ImageCacheGcBlockedReason::DeleteFailed(reason)
+                        if reason.contains("P2P transport is not initialized")
+                )
+        }));
+    }
+
+    #[tokio::test]
     async fn runtime_config_hold_tracks_only_commit_store_commits() {
         let temp = TempDir::new().expect("tempdir");
         let service = Arc::new(test_service(&temp));
@@ -1721,7 +1816,7 @@ mod tests {
         let outside_file = temp.path().join("elsewhere/foreign.commit");
         let outside_file_only = temp.path().join("elsewhere/runtime.commit");
         service
-            .record_hard_commit_object("sha256:leased", Some(leased.clone()), Some(6))
+            .record_hard_commit_object("sha256:leased", Some(leased.clone()), Some(6), &[])
             .await
             .expect("record leased object");
 
@@ -1852,7 +1947,7 @@ mod tests {
         let service = Arc::new(test_service(&temp));
         let file = write_commit_file(&service, "sha256:held", b"held");
         service
-            .record_hard_commit_object("sha256:held", Some(file.clone()), Some(4))
+            .record_hard_commit_object("sha256:held", Some(file.clone()), Some(4), &[])
             .await
             .expect("record fact");
 
