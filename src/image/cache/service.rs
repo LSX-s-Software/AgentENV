@@ -34,10 +34,10 @@ use crate::cfg::{AppConfig, ResolvedImageCacheConfig};
 use crate::digest::FileDigest;
 use crate::image::commit_index::{self, CommitIndex};
 use crate::image::local_layer::LocalLayer;
-use crate::image::oci_image::{ImageConversion, LayerConversionKey};
+use crate::image::oci_image::{ConvertedLayerP2pMetadata, ImageConversion, LayerConversionKey};
 use crate::image::ImageResolutionMetadata;
 use crate::local_store::LocalStoreDurability;
-use crate::p2p::{P2pArtifactKey, P2pTransport};
+use crate::p2p::{P2pArtifactKey, P2pPublishMode, P2pPublishRequest, P2pTransport};
 
 const IMAGE_CACHE_CONFIG_DIR: &str = "configs";
 const IMAGE_CACHE_INDEX_DIR: &str = "indexes";
@@ -273,6 +273,39 @@ impl ImageCacheService {
             .await?
             .add_hard_commit_p2p_key(&HardCommitId::new(digest)?, key)
             .await
+    }
+
+    /// Persist ownership for a converted OCI layer before publishing it to the
+    /// P2P catalog. A missing transport is a normal no-op; callers can keep the
+    /// local conversion path usable when P2P is disabled.
+    async fn publish_converted_layer(
+        &self,
+        key: &LayerConversionKey,
+        layer: &LocalLayer,
+    ) -> Result<bool> {
+        let Some(transport) = self.p2p_transport.get().cloned() else {
+            return Ok(false);
+        };
+
+        // Recording ownership first closes the crash window where a catalog entry could
+        // outlive the cache metadata that tells GC how to remove it.
+        let p2p_key = key.p2p_key();
+        let p2p_metadata = ConvertedLayerP2pMetadata::from_local_layer(layer);
+        let serialized_metadata = serde_json::to_value(&p2p_metadata)
+            .context("serialize converted image layer P2P metadata")?;
+        self.add_hard_commit_p2p_key(&layer.digest, &p2p_key)
+            .await
+            .with_context(|| format!("record converted image layer P2P ownership '{p2p_key}'"))?;
+
+        let request = P2pPublishRequest::file(p2p_key.clone(), layer.path.clone())
+            .with_publish_mode(P2pPublishMode::Reference)
+            .with_metadata(serialized_metadata);
+        transport
+            .publish(&request)
+            .await
+            .with_context(|| format!("publish converted image layer '{p2p_key}'"))?;
+
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -1206,6 +1239,114 @@ impl ImageCacheOperationHold {
             .seed_and_record_hard_commit(temp_commit, digest, size, true, p2p_keys)
             .await
     }
+
+    async fn write_conversion_index(
+        &self,
+        key: &LayerConversionKey,
+        layer: &LocalLayer,
+    ) -> Result<()> {
+        let index = CommitIndex::oci_layer(
+            key.source_layer_digest.clone(),
+            layer.digest.clone(),
+            layer.size,
+            key.converter_id.clone(),
+            key.virtual_size_gib,
+            key.mkfs,
+            key.parent_commit_digest.clone(),
+        );
+        index
+            .write(&self.conversion_index_path(
+                &key.source_layer_digest,
+                &key.converter_id,
+                key.virtual_size_gib,
+                key.mkfs,
+                key.parent_commit_digest.as_deref(),
+            ))
+            .await
+    }
+
+    async fn lookup_remote_converted_layer(
+        &mut self,
+        key: &LayerConversionKey,
+    ) -> Result<Option<LocalLayer>> {
+        let Some(transport) = self.image_cache.p2p_transport.get().cloned() else {
+            return Ok(None);
+        };
+        let p2p_key = key.p2p_key();
+        let descriptor = match transport.lookup(&p2p_key).await {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                debug!(key = %p2p_key, error = %error, "P2P converted image layer lookup failed; falling back to registry conversion");
+                return Ok(None);
+            }
+        };
+        let metadata = match ConvertedLayerP2pMetadata::parse(&descriptor.metadata) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                debug!(key = %p2p_key, error = %error, "P2P converted image layer metadata mismatch; falling back to registry conversion");
+                return Ok(None);
+            }
+        };
+
+        let staging = self.create_temp_staging_dir()?;
+        let destination = staging.path().join("overlaybd.commit");
+        if let Err(error) = transport.fetch(&descriptor, &destination).await {
+            debug!(key = %p2p_key, error = %error, "P2P converted image layer fetch failed; falling back to registry conversion");
+            return Ok(None);
+        }
+        let described = match FileDigest::describe(&destination).await {
+            Ok(described) => described,
+            Err(error) => {
+                debug!(key = %p2p_key, error = %error, "P2P converted image layer digest failed; falling back to registry conversion");
+                // A successful fetch automatically republishes the P2P artifact, so if the file is invalid, we must unpublish it.
+                let _ = transport.unpublish(&p2p_key).await;
+                return Ok(None);
+            }
+        };
+        if described.sha256 != metadata.commit_digest || described.size != metadata.size {
+            debug!(
+                key = %p2p_key,
+                expected_digest = %metadata.commit_digest,
+                actual_digest = %described.sha256,
+                expected_size = metadata.size,
+                actual_size = described.size,
+                "P2P converted image layer failed digest or size validation"
+            );
+            let _ = transport.unpublish(&p2p_key).await;
+            return Ok(None);
+        }
+        match read_overlaybd_layer_uuid(&destination) {
+            Ok(uuid) if uuid == key.expected_layer_uuid => {}
+            Ok(uuid) => {
+                debug!(key = %p2p_key, found_uuid = %uuid, expected_uuid = %key.expected_layer_uuid, "P2P converted image layer UUID mismatch");
+                let _ = transport.unpublish(&p2p_key).await;
+                return Ok(None);
+            }
+            Err(error) => {
+                debug!(key = %p2p_key, error = %error, "P2P converted image layer is not a sealed OverlayBD layer");
+                let _ = transport.unpublish(&p2p_key).await;
+                return Ok(None);
+            }
+        }
+
+        let stored = self
+            .persist_overlaybd_commit(
+                &destination,
+                &metadata.commit_digest,
+                metadata.size,
+                std::slice::from_ref(&p2p_key),
+            )
+            .await?;
+        let layer = LocalLayer {
+            path: stored,
+            digest: metadata.commit_digest,
+            size: metadata.size,
+        };
+        self.write_conversion_index(key, &layer).await?;
+        info!(key = %p2p_key, digest = %layer.digest, "reused converted user image layer from P2P");
+        Ok(Some(layer))
+    }
 }
 
 #[async_trait]
@@ -1241,7 +1382,7 @@ impl ImageConversion for ImageCacheOperationHold {
                 path = %index_path.display(),
                 "converted user image layer index is missing from cache"
             );
-            return Ok(None);
+            return self.lookup_remote_converted_layer(key).await;
         };
         if !index.matches_oci_context(
             &key.source_layer_digest,
@@ -1255,7 +1396,7 @@ impl ImageConversion for ImageCacheOperationHold {
                 path = %index_path.display(),
                 "converted user image layer index has stale conversion context"
             );
-            return Ok(None);
+            return self.lookup_remote_converted_layer(key).await;
         }
 
         // Protect the indexed commit BEFORE stat'ing its file. A concurrent GC
@@ -1277,7 +1418,7 @@ impl ImageConversion for ImageCacheOperationHold {
                 path = %cached.display(),
                 "converted user image layer commit is missing from cache"
             );
-            return Ok(None);
+            return self.lookup_remote_converted_layer(key).await;
         }
 
         match read_overlaybd_layer_uuid(&cached) {
@@ -1291,7 +1432,7 @@ impl ImageConversion for ImageCacheOperationHold {
                     expected_uuid = %key.expected_layer_uuid,
                     "converted user image layer cache has stale UUID"
                 );
-                return Ok(None);
+                return self.lookup_remote_converted_layer(key).await;
             }
             Err(err) => {
                 info!(
@@ -1301,7 +1442,7 @@ impl ImageConversion for ImageCacheOperationHold {
                     error = %err,
                     "converted user image layer cache is not a valid sealed overlaybd layer"
                 );
-                return Ok(None);
+                return self.lookup_remote_converted_layer(key).await;
             }
         }
 
@@ -1332,29 +1473,20 @@ impl ImageConversion for ImageCacheOperationHold {
         let stored = self
             .persist_overlaybd_commit(temp_commit, &described.sha256, described.size, &[])
             .await?;
-        let index = CommitIndex::oci_layer(
-            key.source_layer_digest.clone(),
-            described.sha256.clone(),
-            described.size,
-            key.converter_id.clone(),
-            key.virtual_size_gib,
-            key.mkfs,
-            key.parent_commit_digest.clone(),
-        );
-        index
-            .write(&self.conversion_index_path(
-                &key.source_layer_digest,
-                &key.converter_id,
-                key.virtual_size_gib,
-                key.mkfs,
-                key.parent_commit_digest.as_deref(),
-            ))
-            .await?;
-        Ok(LocalLayer {
+        let layer = LocalLayer {
             path: stored,
             digest: described.sha256,
             size: described.size,
-        })
+        };
+        if let Err(error) = self.image_cache.publish_converted_layer(key, &layer).await {
+            debug!(
+                key = %key.p2p_key(),
+                error = %error,
+                "failed to publish converted image layer to P2P"
+            );
+        }
+        self.write_conversion_index(key, &layer).await?;
+        Ok(layer)
     }
 }
 
@@ -1410,6 +1542,9 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use overlaybd::backend::local::LocalFile;
+    use overlaybd::index_file::{create_file_rw, LayerInfo};
+    use overlaybd::virtual_file::VirtualFile;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1523,6 +1658,18 @@ mod tests {
             .collect()
     }
 
+    async fn write_sealed_layer(path: &Path, uuid: uuid::Uuid) {
+        let index_path = path.with_extension("index");
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).expect("data file"));
+        let index_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::new(index_path).expect("index file"));
+        let mut info = LayerInfo::new(data_file, Some(index_file), 8192);
+        info.uuid = uuid;
+        let file = create_file_rw(info).await.expect("create rw layer");
+        file.write_at(0, &[0x5a; 4096]).await.expect("write layer");
+        file.close_seal().await.expect("seal layer");
+    }
+
     /// Conversion key matching `write_test_index`'s context (converter
     /// `test-converter`, virtual size 1, no parent, mkfs false).
     fn test_conversion_key(source_digest: &str, expected_uuid: uuid::Uuid) -> LayerConversionKey {
@@ -1560,6 +1707,154 @@ mod tests {
             .await
             .expect("lookup")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn publish_converted_layer_records_p2p_ownership() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        service.ensure_layout().await.expect("ensure layout");
+        let transport = Arc::new(MockTransport::default());
+        service.initialize_p2p_transport(transport.clone());
+
+        let digest = "sha256:converted";
+        let file = write_commit_file(&service, digest, b"converted");
+        service
+            .record_hard_commit_object(digest, Some(file.clone()), Some(9), &[])
+            .await
+            .expect("record converted commit");
+        let key = test_conversion_key("sha256:source", uuid::Uuid::new_v4());
+        let layer = LocalLayer {
+            path: file,
+            digest: digest.to_string(),
+            size: 9,
+        };
+
+        assert!(service
+            .publish_converted_layer(&key, &layer)
+            .await
+            .expect("publish converted layer"));
+        let p2p_key = key.p2p_key();
+        let descriptor = transport
+            .descriptors
+            .read()
+            .await
+            .get(&p2p_key)
+            .cloned()
+            .expect("published descriptor");
+        assert_eq!(
+            ConvertedLayerP2pMetadata::parse(&descriptor.metadata)
+                .expect("metadata")
+                .commit_digest,
+            digest
+        );
+        let record = service
+            .metadata_store()
+            .await
+            .expect("metadata store")
+            .get_hard_commit_object(&HardCommitId::new(digest).expect("commit id"))
+            .await
+            .expect("read commit record")
+            .expect("commit record");
+        assert!(record.p2p_keys.contains(&p2p_key));
+    }
+
+    #[tokio::test]
+    async fn failed_converted_layer_publish_keeps_gc_ownership_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        service.ensure_layout().await.expect("ensure layout");
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .fail_publish
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        service.initialize_p2p_transport(transport);
+
+        let digest = "sha256:publish-failure";
+        let file = write_commit_file(&service, digest, b"payload");
+        service
+            .record_hard_commit_object(digest, Some(file.clone()), Some(7), &[])
+            .await
+            .expect("record converted commit");
+        let key = test_conversion_key("sha256:source-failure", uuid::Uuid::new_v4());
+        let layer = LocalLayer {
+            path: file,
+            digest: digest.to_string(),
+            size: 7,
+        };
+
+        assert!(service.publish_converted_layer(&key, &layer).await.is_err());
+        let record = service
+            .metadata_store()
+            .await
+            .expect("metadata store")
+            .get_hard_commit_object(&HardCommitId::new(digest).expect("commit id"))
+            .await
+            .expect("read commit record")
+            .expect("commit record");
+        assert!(record.p2p_keys.contains(&key.p2p_key()));
+    }
+
+    #[tokio::test]
+    async fn lookup_converted_layer_rehydrates_from_p2p() {
+        let provider_temp = TempDir::new().expect("provider tempdir");
+        let consumer_temp = TempDir::new().expect("consumer tempdir");
+        let provider = Arc::new(test_service(&provider_temp));
+        let consumer = Arc::new(test_service(&consumer_temp));
+        provider.ensure_layout().await.expect("provider layout");
+        consumer.ensure_layout().await.expect("consumer layout");
+        let transport = Arc::new(MockTransport::default());
+        provider.initialize_p2p_transport(transport.clone());
+        consumer.initialize_p2p_transport(transport.clone());
+
+        let key = test_conversion_key("sha256:source-p2p", uuid::Uuid::new_v4());
+        let provider_path = provider_temp.path().join("provider.commit");
+        write_sealed_layer(&provider_path, key.expected_layer_uuid).await;
+        let described = FileDigest::describe(&provider_path)
+            .await
+            .expect("describe provider layer");
+        let provider_digest = HardCommitId::new(&described.sha256).expect("provider digest");
+        provider
+            .record_hard_commit_object(
+                &described.sha256,
+                Some(provider_path.clone()),
+                Some(described.size),
+                &[],
+            )
+            .await
+            .expect("record provider layer");
+        provider
+            .publish_converted_layer(
+                &key,
+                &LocalLayer {
+                    path: provider_path,
+                    digest: described.sha256.clone(),
+                    size: described.size,
+                },
+            )
+            .await
+            .expect("publish provider layer");
+
+        let mut hold = consumer
+            .begin_hard_commit_operation("p2p-rehydrate")
+            .expect("hold");
+        let layer = hold
+            .lookup_converted_layer(&key)
+            .await
+            .expect("lookup remote layer")
+            .expect("remote layer");
+        assert_eq!(layer.digest, described.sha256);
+        assert_eq!(layer.size, described.size);
+        assert!(layer.path.exists());
+        let record = consumer
+            .metadata_store()
+            .await
+            .expect("consumer metadata store")
+            .get_hard_commit_object(&provider_digest)
+            .await
+            .expect("read consumer record")
+            .expect("consumer commit record");
+        assert!(record.p2p_keys.contains(&key.p2p_key()));
     }
 
     #[tokio::test]
