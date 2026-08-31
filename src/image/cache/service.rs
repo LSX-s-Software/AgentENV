@@ -276,8 +276,8 @@ impl ImageCacheService {
     }
 
     /// Persist ownership for a converted OCI layer before publishing it to the
-    /// P2P catalog. A missing transport is a normal no-op; callers can keep the
-    /// local conversion path usable when P2P is disabled.
+    /// P2P catalog. A missing or disabled transport is a normal no-op; callers
+    /// can keep the local conversion path usable when P2P is disabled.
     async fn publish_converted_layer(
         &self,
         key: &LayerConversionKey,
@@ -286,6 +286,9 @@ impl ImageCacheService {
         let Some(transport) = self.p2p_transport.get().cloned() else {
             return Ok(false);
         };
+        if transport.local_endpoint().is_none() {
+            return Ok(false);
+        }
 
         // Recording ownership first closes the crash window where a catalog entry could
         // outlive the cache metadata that tells GC how to remove it.
@@ -442,6 +445,7 @@ impl ImageCacheService {
             image_cache,
             owner,
             digests,
+            attempted_p2p_lookups: BTreeSet::new(),
             materialized: true,
             released: false,
         })
@@ -456,6 +460,7 @@ impl ImageCacheService {
             image_cache: Arc::clone(self),
             owner: Self::next_operation_hold_owner(operation)?,
             digests: BTreeSet::new(),
+            attempted_p2p_lookups: BTreeSet::new(),
             materialized: false,
             released: false,
         })
@@ -1171,6 +1176,7 @@ pub(crate) struct ImageCacheOperationHold {
     image_cache: Arc<ImageCacheService>,
     owner: ImageCacheHoldOwner,
     digests: BTreeSet<HardCommitId>,
+    attempted_p2p_lookups: BTreeSet<P2pArtifactKey>,
     materialized: bool,
     released: bool,
 }
@@ -1273,6 +1279,10 @@ impl ImageCacheOperationHold {
             return Ok(None);
         };
         let p2p_key = key.p2p_key();
+        if !self.attempted_p2p_lookups.insert(p2p_key.clone()) {
+            debug!(key = %p2p_key, "skipping repeated P2P converted image layer lookup");
+            return Ok(None);
+        }
         let descriptor = match transport.lookup(&p2p_key).await {
             Ok(Some(descriptor)) => descriptor,
             Ok(None) => return Ok(None),
@@ -1553,6 +1563,7 @@ mod tests {
     use crate::image::commit_index;
     use crate::image::ImageBaseContext;
     use crate::p2p::mock::MockTransport;
+    use crate::p2p::{DisabledP2pTransport, P2pArtifactDescriptor, P2pArtifactProvider};
 
     fn test_service(temp: &TempDir) -> ImageCacheService {
         let root_dir = temp.path().join("image-cache");
@@ -1760,6 +1771,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_p2p_publish_does_not_record_ownership() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        service.ensure_layout().await.expect("ensure layout");
+        service.initialize_p2p_transport(Arc::new(DisabledP2pTransport));
+
+        let digest = "sha256:disabled-p2p";
+        let file = write_commit_file(&service, digest, b"converted");
+        service
+            .record_hard_commit_object(digest, Some(file.clone()), Some(9), &[])
+            .await
+            .expect("record converted commit");
+        let key = test_conversion_key("sha256:disabled-source", uuid::Uuid::new_v4());
+        let layer = LocalLayer {
+            path: file,
+            digest: digest.to_string(),
+            size: 9,
+        };
+
+        assert!(!service
+            .publish_converted_layer(&key, &layer)
+            .await
+            .expect("skip disabled P2P publish"));
+        let record = service
+            .metadata_store()
+            .await
+            .expect("metadata store")
+            .get_hard_commit_object(&HardCommitId::new(digest).expect("commit id"))
+            .await
+            .expect("read commit record")
+            .expect("commit record");
+        assert!(record.p2p_keys.is_empty());
+    }
+
+    #[tokio::test]
     async fn failed_converted_layer_publish_keeps_gc_ownership_record() {
         let temp = TempDir::new().expect("tempdir");
         let service = Arc::new(test_service(&temp));
@@ -1855,6 +1901,80 @@ mod tests {
             .expect("read consumer record")
             .expect("consumer commit record");
         assert!(record.p2p_keys.contains(&key.p2p_key()));
+    }
+
+    #[tokio::test]
+    async fn failed_p2p_fetch_is_attempted_once_per_operation() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        service.ensure_layout().await.expect("ensure layout");
+        let transport = Arc::new(MockTransport::default());
+        service.initialize_p2p_transport(transport.clone());
+
+        let key = test_conversion_key("sha256:stale-p2p", uuid::Uuid::new_v4());
+        let p2p_key = key.p2p_key();
+        let advertised_layer = LocalLayer {
+            path: temp.path().join("missing.commit"),
+            digest: "sha256:missing-p2p-blob".to_string(),
+            size: 123,
+        };
+        transport.descriptors.write().await.insert(
+            p2p_key.clone(),
+            P2pArtifactDescriptor {
+                key: p2p_key,
+                providers: vec![P2pArtifactProvider::Local],
+                backend_locator: Some("missing-mock-blob".to_string()),
+                metadata: serde_json::to_value(ConvertedLayerP2pMetadata::from_local_layer(
+                    &advertised_layer,
+                ))
+                .expect("serialize converted layer metadata"),
+            },
+        );
+
+        let mut first_hold = service
+            .begin_hard_commit_operation("first-p2p-fetch")
+            .expect("first hold");
+        for _ in 0..2 {
+            assert!(first_hold
+                .lookup_converted_layer(&key)
+                .await
+                .expect("lookup converted layer")
+                .is_none());
+        }
+        assert_eq!(
+            transport
+                .lookup_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            transport
+                .fetch_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        drop(first_hold);
+
+        let mut second_hold = service
+            .begin_hard_commit_operation("second-p2p-fetch")
+            .expect("second hold");
+        assert!(second_hold
+            .lookup_converted_layer(&key)
+            .await
+            .expect("retry lookup in new operation")
+            .is_none());
+        assert_eq!(
+            transport
+                .lookup_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            transport
+                .fetch_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 
     #[tokio::test]
