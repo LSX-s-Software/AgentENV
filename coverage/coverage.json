@@ -5,21 +5,21 @@
     "total": 0
   },
   "functions": {
-    "coverage": "74.40%",
-    "missed": 1368,
-    "total": 5343
+    "coverage": "71.71%",
+    "missed": 1629,
+    "total": 5758
   },
-  "generated_at": "2026-09-01T02:04:45Z",
+  "generated_at": "2026-09-08T04:33:21Z",
   "lines": {
-    "coverage": "78.57%",
-    "missed": 9703,
-    "total": 45284
+    "coverage": "76.48%",
+    "missed": 11416,
+    "total": 48533
   },
   "package": "workspace",
   "regions": {
-    "coverage": "77.82%",
-    "missed": 14172,
-    "total": 63908
+    "coverage": "75.56%",
+    "missed": 16747,
+    "total": 68513
   },
-  "run_url": "https://github.com/LSX-s-Software/AgentENV/actions/runs/33459491018"
+  "run_url": "https://github.com/LSX-s-Software/AgentENV/actions/runs/34185993281"
 }
